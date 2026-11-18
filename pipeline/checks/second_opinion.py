@@ -35,10 +35,57 @@ Gợi ý
 - `iou_xywh` có sẵn. Dòng nhãn hỏng không được làm script chết (dùng `ds.valid_boxes` và `parse_yolo_line` trong try).
 - Kết quả phụ thuộc mạnh vào ngưỡng: calibrate chúng ở Bước 3 thay vì đoán.
 """
-from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
-from ..model_cache import get_preds  # noqa: F401
+from ..common import WARN, Issue, iou_xywh, parse_yolo_line
+from ..model_cache import get_preds
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    c = cfg["second_opinion"]
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+    n_cls = len(ds.classes)
+    issues = []
+    for img in ds.image_files():
+        stem = img.stem
+        lines = ds.read_label_lines(stem)
+        size = ds.image_size(stem)
+        if stem not in preds or lines is None or size is None:
+            continue
+        W, H = size
+        labels = []                                  # (số dòng gốc, lớp, box) — chỉ dòng hợp lệ
+        for n, text in lines:
+            try:
+                cls, *box = parse_yolo_line(text)
+            except ValueError:
+                continue
+            if 0 <= cls < n_cls:
+                labels.append((n, cls, box))
+
+        def add(code, msg, line=None, **extra):
+            issues.append(Issue("second_opinion", WARN, code, stem, msg, line, extra))
+
+        for r in preds[stem]:
+            pcls, conf, box = int(r[0]), r[1], r[2:6]
+            if conf < c["conf"] or box[2] * W * box[3] * H < c["min_area_px"]:
+                continue
+            cands = [(iou_xywh(box, lb), lc) for _, lc, lb in labels]
+            cands = [(v, lc) for v, lc in cands if v >= c["iou_missing"]]
+            if not cands:
+                add("POSSIBLE_MISSING", f"model thấy lớp {pcls} (conf {conf:.2f}) mà nhãn không có box", conf=conf, pred_cls=pcls)
+                continue
+            same = [v for v, lc in cands if lc == pcls]
+            if same:                                 # nhãn cùng lớp đã phủ vật: chỉ còn hỏi box có lỏng không
+                if max(same) < c["iou_loose"]:
+                    add("POSSIBLE_LOOSE_BOX", f"box lỏng/lệch, IoU {max(same):.2f}", conf=conf, iou=round(max(same), 4))
+                continue
+            iou, lcls = max(cands)
+            if iou >= c["iou_match"]:
+                add("POSSIBLE_WRONG_CLASS", f"nhãn lớp {lcls}, model nói lớp {pcls} (conf {conf:.2f})",
+                    conf=conf, iou=round(iou, 4), label_cls=lcls, pred_cls=pcls)
+
+        fp_boxes = [r[2:6] for r in preds[stem] if r[1] >= c["fp_conf"]]
+        for n, lc, lb in labels:
+            best = max((iou_xywh(lb, b) for b in fp_boxes), default=0.0)
+            if best < c["iou_missing"]:
+                add("POSSIBLE_FALSE_POS", f"box lớp {lc} không khớp dự đoán nào (IoU tốt nhất {best:.2f})", n, iou=round(best, 4))
+    return issues
